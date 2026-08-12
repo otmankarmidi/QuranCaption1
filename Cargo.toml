@@ -1,0 +1,57 @@
+[package]
+name = "qurancaption"
+version = "3.6.65"
+description = "Transform Quranic recitations into stunning captioned videos with professional quality subtitles and translations in 40+ languages."
+authors = ["Rayane STASZEWSKI"]
+license = "Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)"
+repository = "zonetecde/qurancaption"
+edition = "2021"
+rust-version = "1.77.2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "qurancaption_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.3.0", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.6.0", features = ["protocol-asset", "devtools"] }
+tauri-plugin-log = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-store = "2"
+tauri-plugin-deep-link = "2.4.7"
+tauri-plugin-notification = "2"
+tauri-plugin-single-instance = { version = "2.4.0", features = ["deep-link"] }
+dirs = "6.0.0"
+tauri-plugin-dialog = "2"
+font-kit = "0.14.3"
+tokio = { version = "1.0", features = ["process", "io-util", "rt-multi-thread", "fs", "net", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
+base64 = "0.22"
+rand = "0.9"
+sha2 = "0.10"
+regex = "1.0"
+lazy_static = "1.4"
+md5 = "0.7"
+image = "0.24"
+rayon = "1.10"
+rodio = { version = "0.20.1", default-features = false, features = ["symphonia-all"] }
+pitch_shift = "2.1.0"
+discord-rich-presence = "0.2"
+fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs" }
+bytes = "1"
+futures-util = "0.3"
+tauri-plugin-process = "2"
+keyring = { version = "3.6.2", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+screenshots = "0.8"
+sysinfo = "0.30"
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-updater = "2"

@@ -1,0 +1,143 @@
+{
+	"$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+	"productName": "Quran Caption",
+	"version": "3.6.65",
+	"identifier": "com.qurancaption",
+	"build": {
+		"frontendDist": "../build",
+		"devUrl": "http://localhost:5173",
+		"beforeDevCommand": "npm run dev",
+		"beforeBuildCommand": "npm run build"
+	},
+	"app": {
+		"windows": [
+			{
+				"title": "Quran Caption",
+				"height": 768,
+				"width": 1024,
+				"minWidth": 1024,
+				"minHeight": 768,
+				"resizable": true,
+				"fullscreen": false,
+				"decorations": false
+			}
+		],
+		"security": {
+			"csp": null,
+			"assetProtocol": {
+				"enable": true,
+				"scope": {
+					"allow": [
+						"**",
+						"*",
+						"$APPCONFIG",
+						"$APPCONFIG/**",
+						"$APPDATA",
+						"$APPDATA/**",
+						"$APPLOCALDATA",
+						"$APPLOCALDATA/**",
+						"$APPCACHE",
+						"$APPCACHE/**",
+						"$APPLOG",
+						"$APPLOG/**",
+						"$AUDIO",
+						"$AUDIO/**",
+						"$CACHE",
+						"$CACHE/**",
+						"$CONFIG",
+						"$CONFIG/**",
+						"$DATA",
+						"$DATA/**",
+						"$LOCALDATA",
+						"$LOCALDATA/**",
+						"$DESKTOP",
+						"$DESKTOP/**",
+						"$DOCUMENT",
+						"$DOCUMENT/**",
+						"$DOWNLOAD",
+						"$DOWNLOAD/**",
+						"$EXE",
+						"$EXE/**",
+						"$FONT",
+						"$FONT/**",
+						"$HOME",
+						"$HOME/**",
+						"$PICTURE",
+						"$PICTURE/**",
+						"$PUBLIC",
+						"$PUBLIC/**",
+						"$RUNTIME",
+						"$RUNTIME/**",
+						"$TEMPLATE",
+						"$TEMPLATE/**",
+						"$VIDEO",
+						"$VIDEO/**",
+						"$RESOURCE",
+						"$RESOURCE/**",
+						"$TEMP",
+						"$TEMP/**"
+					]
+				}
+			}
+		}
+	},
+	"bundle": {
+		"active": true,
+		"createUpdaterArtifacts": true,
+		"targets": [
+			"deb",
+			"appimage",
+			"app",
+			"dmg",
+			"nsis"
+		],
+		"resources": [
+			"binaries/**/*",
+			"resources/notifications/**/*",
+			"python/**/*"
+		],
+		"icon": [
+			"icons/32x32.png",
+			"icons/128x128.png",
+			"icons/128x128@2x.png",
+			"icons/icon.icns",
+			"icons/icon.ico"
+		],
+		"macOS": {
+			"entitlements": null,
+			"exceptionDomain": "",
+			"frameworks": [],
+			"providerShortName": null,
+			"signingIdentity": null,
+			"hardenedRuntime": true,
+			"minimumSystemVersion": "10.13"
+		},
+		"linux": {
+			"deb": {
+				"depends": [
+					"libc6",
+					"libgtk-3-0",
+					"libwebkit2gtk-4.1-0"
+				]
+			}
+		}
+	},
+	"plugins": {
+		"deep-link": {
+			"desktop": {
+				"schemes": [
+					"qurancaption"
+				]
+			}
+		},
+		"updater": {
+			"pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc1RkVENzQxMDIzODU2MzUKUldRMVZqZ0NRZGYrZFVBbHVpUXkzbHpzR2luSEZZRWpFaVd5Vm9KaWJKNjNlcmxXVE1TOTZBUW0K",
+			"endpoints": [
+				"https://github.com/zonetecde/QuranCaption/releases/latest/download/latest.json"
+			],
+			"windows": {
+				"installMode": "passive"
+			}
+		}
+	}
+}
