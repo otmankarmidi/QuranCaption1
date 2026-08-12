@@ -1,0 +1,705 @@
+import { globalState } from '$lib/runes/main.svelte';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+import { appDataDir, basename, extname, join } from '@tauri-apps/api/path';
+import { copyFile, exists, mkdir, readDir, remove } from '@tauri-apps/plugin-fs';
+import { getQpcGlyphIndexesForWord, getQpcVerseNumberGlyphIndex } from './QpcGlyphWordOverrides';
+import { getSystemFontSubsetDataUrl } from './SystemFontSubset';
+
+type SystemFontSource = {
+	family: string;
+	sourceFamily: string;
+	fullName: string;
+	postscriptName: string | null;
+	path: string;
+	fontIndex: number;
+	format: string | null;
+	fontWeight: number;
+	fontWeightRange: string | null;
+	fontStyle: string;
+};
+
+type RegisteredSystemFontFace = {
+	source: SystemFontSource;
+	style: HTMLStyleElement;
+};
+
+export type ImportedFont = {
+	family: string;
+	label: string;
+	path: string;
+	format: 'opentype' | 'truetype' | 'woff' | 'woff2';
+};
+
+export class QPCFontProvider {
+	static qpc2Glyphs: Record<string, string> | undefined = undefined;
+	static qpc1Glyphs: Record<string, string> | undefined = undefined;
+	static verseMappingV2: Record<string, string> | undefined = undefined;
+	static verseMappingV1: Record<string, string> | undefined = undefined;
+	static loadedFonts: Set<string> = new Set();
+	static fontLoadPromises: Map<string, Promise<void>> = new Map();
+	static resolvedSystemFontFamilies: Set<string> = new Set();
+	static registeredSystemFontFaces: Set<string> = new Set();
+	static registeredSystemFontFaceRules: Map<string, RegisteredSystemFontFace> = new Map();
+	static importedFontsPromise: Promise<ImportedFont[]> | null = null;
+	private static readonly FONT_WAIT_TIMEOUT_MS = 1200;
+	private static readonly IMPORTED_FONTS_FOLDER = 'imported-fonts';
+	private static readonly IMPORTED_FONT_FILE_PATTERN =
+		/^(\d+-[a-z0-9]+)__(.+)\.(otf|ttf|woff|woff2)$/i;
+	private static readonly TAJWEED_FONT_BASE_URL =
+		'https://cdn.jsdelivr.net/gh/quran/quran.com-frontend-next/public/fonts/quran/hafs/v4/colrv1';
+
+	static async loadQPC2Data() {
+		if (!QPCFontProvider.qpc2Glyphs) {
+			QPCFontProvider.qpc2Glyphs = await (await fetch('/QPC2/qpc-v2.json')).json();
+		}
+		if (!QPCFontProvider.qpc1Glyphs) {
+			QPCFontProvider.qpc1Glyphs = await (await fetch('/QPC1/qpc-v1.json')).json();
+		}
+
+		if (!QPCFontProvider.verseMappingV2) {
+			// verse-mapping by Primo - May Allah reward him for his work
+			QPCFontProvider.verseMappingV2 = await (await fetch('/QPC2/verse-mapping.json')).json();
+		}
+		if (!QPCFontProvider.verseMappingV1) {
+			// verse-mapping by Primo - May Allah reward him for his work
+			QPCFontProvider.verseMappingV1 = await (await fetch('/QPC1/verse-mapping.json')).json();
+		}
+
+		// Charge déjà le fichier font avec la basmala
+		QPCFontProvider.loadFontIfNotLoaded('QPC1BSML', '1');
+		QPCFontProvider.loadFontIfNotLoaded('QPC2BSML', '2');
+	}
+
+	/**
+	 * Copie une police dans la bibliothèque globale puis la charge dans le document.
+	 * @param {string} sourcePath Chemin du fichier choisi par l’utilisateur.
+	 * @returns {Promise<ImportedFont>} Police importée et prête à être utilisée.
+	 */
+	static async importFontFromFile(sourcePath: string): Promise<ImportedFont> {
+		const extension = (await extname(sourcePath)).toLowerCase().replace(/^\./, '');
+		if (!['otf', 'ttf', 'woff', 'woff2'].includes(extension)) {
+			throw new Error('Unsupported font format');
+		}
+
+		const originalFileName = await basename(sourcePath);
+		const rawLabel = originalFileName.slice(0, -(extension.length + 1));
+		const label =
+			rawLabel
+				.replace(/[<>:"/\\|?*]/g, '_')
+				.trim()
+				.slice(0, 80) || 'font';
+		const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+		const folder = await QPCFontProvider.getImportedFontsFolder();
+		const destinationPath = await join(folder, `${id}__${label}.${extension}`);
+
+		await copyFile(sourcePath, destinationPath);
+		const font = QPCFontProvider.parseImportedFont(destinationPath, `${id}__${label}.${extension}`);
+		if (!font) {
+			await remove(destinationPath);
+			throw new Error('Invalid imported font file');
+		}
+
+		try {
+			await QPCFontProvider.registerImportedFont(font);
+			QPCFontProvider.importedFontsPromise = null;
+			return font;
+		} catch (error) {
+			await remove(destinationPath);
+			throw error;
+		}
+	}
+
+	/**
+	 * Charge toutes les polices de la bibliothèque globale dans le document courant.
+	 * @returns {Promise<ImportedFont[]>} Polices valides disponibles dans Quran Caption.
+	 */
+	static loadImportedFonts(): Promise<ImportedFont[]> {
+		QPCFontProvider.importedFontsPromise ??= (async () => {
+			const folder = await QPCFontProvider.getImportedFontsFolder();
+			const entries = await readDir(folder);
+			const fonts: ImportedFont[] = [];
+
+			for (const entry of entries) {
+				if (!entry.isFile || !entry.name) continue;
+				const path = await join(folder, entry.name);
+				const font = QPCFontProvider.parseImportedFont(path, entry.name);
+				if (!font) continue;
+				try {
+					await QPCFontProvider.registerImportedFont(font);
+					fonts.push(font);
+				} catch (error) {
+					console.warn(`Could not load imported font "${font.label}".`, error);
+				}
+			}
+
+			return fonts.sort((a, b) => a.label.localeCompare(b.label));
+		})();
+		return QPCFontProvider.importedFontsPromise;
+	}
+
+	/**
+	 * Crée si nécessaire le dossier global des polices importées.
+	 * @returns {Promise<string>} Chemin absolu du dossier.
+	 */
+	private static async getImportedFontsFolder(): Promise<string> {
+		const folder = await join(await appDataDir(), QPCFontProvider.IMPORTED_FONTS_FOLDER);
+		if (!(await exists(folder))) await mkdir(folder, { recursive: true });
+		return folder;
+	}
+
+	/**
+	 * Reconstitue les métadonnées d’une police depuis son nom de fichier interne.
+	 * @param {string} path Chemin absolu du fichier.
+	 * @param {string} fileName Nom interne du fichier.
+	 * @returns {ImportedFont | null} Métadonnées de police, ou `null` si le nom est invalide.
+	 */
+	private static parseImportedFont(path: string, fileName: string): ImportedFont | null {
+		const match = QPCFontProvider.IMPORTED_FONT_FILE_PATTERN.exec(fileName);
+		if (!match) return null;
+		const [, id, label, extension] = match;
+		const formatByExtension: Record<string, ImportedFont['format']> = {
+			otf: 'opentype',
+			ttf: 'truetype',
+			woff: 'woff',
+			woff2: 'woff2'
+		};
+		return {
+			family: `QCImported-${id}`,
+			label,
+			path,
+			format: formatByExtension[extension.toLowerCase()]
+		};
+	}
+
+	/**
+	 * Enregistre une police importée avec l’API FontFace du navigateur.
+	 * @param {ImportedFont} font Police à enregistrer.
+	 * @returns {Promise<void>} Promesse résolue lorsque la police est chargée.
+	 */
+	private static registerImportedFont(font: ImportedFont): Promise<void> {
+		if (typeof document === 'undefined') return Promise.resolve();
+		if (QPCFontProvider.loadedFonts.has(font.family)) return Promise.resolve();
+
+		const existingPromise = QPCFontProvider.fontLoadPromises.get(font.family);
+		if (existingPromise) return existingPromise;
+
+		const fontUrl = convertFileSrc(font.path);
+		const escapedFontUrl = QPCFontProvider.escapeCssString(fontUrl);
+		const style = document.createElement('style');
+		style.textContent = `
+			@font-face {
+				font-family: "${font.family}";
+				src: url("${escapedFontUrl}") format("${font.format}");
+				font-weight: normal;
+				font-style: normal;
+			}
+		`;
+		document.head.appendChild(style);
+
+		const loadPromise = new FontFace(
+			font.family,
+			`url("${escapedFontUrl}") format("${font.format}")`
+		)
+			.load()
+			.then((fontFace) => {
+				document.fonts.add(fontFace);
+				QPCFontProvider.loadedFonts.add(font.family);
+			})
+			.catch((error) => {
+				style.remove();
+				QPCFontProvider.fontLoadPromises.delete(font.family);
+				throw error;
+			});
+
+		QPCFontProvider.fontLoadPromises.set(font.family, loadPromise);
+		return loadPromise;
+	}
+
+	/**
+	 * Charge dynamiquement une police QCP si elle n'est pas déjà chargée
+	 */
+	static loadFontIfNotLoaded(fontName: string, version: '1' | '2'): Promise<void> {
+		if (typeof document === 'undefined') return Promise.resolve();
+		// Vérifie si la police est déjà chargée
+
+		if (!this.loadedFonts.has(fontName)) {
+			// Crée une nouvelle règle @font-face
+			const style = document.createElement('style');
+
+			// Les polices contenant les basmala/isti3adha sont au format ttf
+			const extension = fontName.includes('BSML') ? 'ttf' : 'woff2';
+			const format = fontName.includes('BSML') ? 'truetype' : 'woff2';
+
+			style.textContent = `
+				@font-face {
+					font-family: '${fontName}';
+					src: url('/QPC${version}/fonts/${fontName}.${extension}') format('${format}');
+					font-weight: normal;
+					font-style: normal;
+				}
+			`;
+			document.head.appendChild(style);
+			// Marque la police comme chargée
+			this.loadedFonts.add(fontName);
+		}
+
+		return this.waitForFontFamily(fontName);
+	}
+
+	static async waitForFontsInElement(element: Element | null | undefined): Promise<void> {
+		if (!element || typeof document === 'undefined' || !('fonts' in document)) return;
+		await QPCFontProvider.loadImportedFonts();
+
+		const fontFamilies = new Set<string>();
+		const nodes = [element, ...Array.from(element.querySelectorAll('*'))];
+
+		for (const node of nodes) {
+			const familyValue = window.getComputedStyle(node).fontFamily;
+			// Pour l'export, seule la famille principale compte: les fallbacks système n'ont
+			// pas besoin d'être sérialisés.
+			const primaryFamily = familyValue
+				.split(',')[0]
+				?.trim()
+				.replace(/^['"]|['"]$/g, '');
+			if (
+				!primaryFamily ||
+				this.isGenericFontFamily(primaryFamily) ||
+				!this.shouldWaitForFontFamily(primaryFamily)
+			) {
+				continue;
+			}
+			fontFamilies.add(primaryFamily);
+		}
+
+		if (fontFamilies.size === 0) return;
+
+		await this.registerSystemFontFacesIfNeeded(Array.from(fontFamilies));
+		await Promise.all(
+			Array.from(fontFamilies).map((fontFamily) => this.waitForFontFamily(fontFamily))
+		);
+		await this.waitForNextPaint();
+	}
+
+	/**
+	 * Remplace temporairement les polices système par des sous-ensembles adaptés à la capture.
+	 * @param {Element | null | undefined} element Élément dont le texte sera capturé.
+	 * @returns {Promise<() => void>} Fonction restaurant les règles de police originales.
+	 */
+	static async applySystemFontSubsetsForScreenshot(
+		element: Element | null | undefined
+	): Promise<() => void> {
+		if (!element || typeof document === 'undefined') return () => {};
+
+		const textsByFamily = new Map<string, string>();
+		const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+		let textNode = walker.nextNode();
+		while (textNode) {
+			const text = textNode.textContent ?? '';
+			const parent = textNode.parentElement;
+			if (text.trim() && parent) {
+				const family = window
+					.getComputedStyle(parent)
+					.fontFamily.split(',')[0]
+					?.trim()
+					.replace(/^['"]|['"]$/g, '')
+					.toLowerCase();
+				if (family) textsByFamily.set(family, (textsByFamily.get(family) ?? '') + text);
+			}
+			textNode = walker.nextNode();
+		}
+
+		const originalRules = new Map<HTMLStyleElement, string>();
+		await Promise.all(
+			Array.from(this.registeredSystemFontFaceRules.values()).map(async ({ source, style }) => {
+				const text = textsByFamily.get(source.family.toLowerCase());
+				if (!text) return;
+
+				try {
+					const fontUrl = convertFileSrc(source.path);
+					const subsetUrl = await getSystemFontSubsetDataUrl(fontUrl, source.fontIndex, text);
+					originalRules.set(style, style.textContent ?? '');
+					style.textContent = this.getSystemFontFaceCss(source, subsetUrl, null);
+				} catch (error) {
+					console.warn('Could not subset system font before export capture.', error);
+				}
+			})
+		);
+
+		if (originalRules.size) {
+			await document.fonts.ready;
+			await this.waitForNextPaint();
+		}
+
+		return () => {
+			for (const [style, cssText] of originalRules) style.textContent = cssText;
+		};
+	}
+
+	static getFontNameForVerse(surah: number, verse: number, qpcVersion: '1' | '2'): string {
+		// Get the font name for the verse
+		const verseKey = `${surah}:${verse}`;
+		const verseMapping = qpcVersion === '1' ? this.verseMappingV1 : this.verseMappingV2;
+		if (!verseMapping) {
+			void QPCFontProvider.loadQPC2Data();
+			return qpcVersion === '1' ? 'QPC1_p0001' : 'QPC2_p0001';
+		}
+
+		const fontName = verseMapping[verseKey] || (qpcVersion === '1' ? 'QPC1_p0001' : 'QPC2_p0001');
+
+		// Charge dynamiquement la police si elle n'est pas déjà chargée
+		QPCFontProvider.loadFontIfNotLoaded(fontName, qpcVersion);
+
+		return fontName;
+	}
+
+	static getTajweedFontNameForVerse(surah: number, verse: number): string {
+		const verseKey = `${surah}:${verse}`;
+		if (!this.verseMappingV2) {
+			void QPCFontProvider.loadQPC2Data();
+			return 'p001-v4';
+		}
+		const mappedFontName = this.verseMappingV2[verseKey] || 'QPC2_p001';
+		const pageNumber = this.extractPageNumberFromMappedFontName(mappedFontName);
+		const fontName = `p${pageNumber}-v4`;
+
+		this.loadTajweedFontIfNotLoaded(fontName, pageNumber);
+		return fontName;
+	}
+
+	static getQuranVerseGlyph(
+		surah: number,
+		verse: number,
+		startWord: number,
+		endWord: number,
+		isLastWords: boolean,
+		qpcVersion: '1' | '2' = '2'
+	): string {
+		const glyphs = qpcVersion === '1' ? QPCFontProvider.qpc1Glyphs : QPCFontProvider.qpc2Glyphs;
+		if (!glyphs) {
+			void QPCFontProvider.loadQPC2Data();
+			return '';
+		}
+
+		let str = QPCFontProvider.getQuranVerseGlyphWords(
+			surah,
+			verse,
+			startWord,
+			endWord,
+			qpcVersion
+		).join(' ');
+
+		// Si on veut inclure le numéro de verset
+		if (isLastWords && globalState.getStyle('arabic', 'show-verse-number')!.value) {
+			const verseNumberGlyphIndex = getQpcVerseNumberGlyphIndex(surah, verse, endWord);
+			const key = `${surah}:${verse}:${verseNumberGlyphIndex + 1}`;
+			const glyph = glyphs[key];
+			if (glyph) {
+				str += (str ? ' ' : '') + glyph; // Ajoute le symbole du numéro de verset
+			}
+		}
+
+		return str.trim();
+	}
+
+	/**
+	 * Retourne les glyphes QPC regroupes par mot logique Uthmani.
+	 * @param {number} surah Numero de sourate.
+	 * @param {number} verse Numero de verset.
+	 * @param {number} startWord Index 0-based du premier mot logique.
+	 * @param {number} endWord Index 0-based du dernier mot logique.
+	 * @param {'1' | '2'} qpcVersion Version QPC a utiliser.
+	 * @returns {string[]} Glyphes regroupes par mot logique.
+	 */
+	static getQuranVerseGlyphWords(
+		surah: number,
+		verse: number,
+		startWord: number,
+		endWord: number,
+		qpcVersion: '1' | '2' = '2'
+	): string[] {
+		const glyphs = qpcVersion === '1' ? QPCFontProvider.qpc1Glyphs : QPCFontProvider.qpc2Glyphs;
+		if (!glyphs) {
+			void QPCFontProvider.loadQPC2Data();
+			return [];
+		}
+
+		const words: string[] = [];
+		for (let wordIndex = startWord; wordIndex <= endWord; wordIndex++) {
+			const wordGlyph = getQpcGlyphIndexesForWord(surah, verse, wordIndex)
+				.map((glyphIndex) => glyphs[`${surah}:${verse}:${glyphIndex + 1}`])
+				.filter((glyph): glyph is string => Boolean(glyph))
+				.join('');
+
+			if (wordGlyph) words.push(wordGlyph);
+		}
+
+		return words;
+	}
+
+	static getBasmalaGlyph(version: '1' | '2'): string {
+		switch (version) {
+			case '1':
+				return '#"!'; // ou alors peut-être -,+*
+			case '2':
+				return 'ﭑﭒﭓ';
+			default:
+				return '';
+		}
+	}
+
+	static getIstiadhahGlyph(version: '1' | '2'): string {
+		switch (version) {
+			case '1':
+				return 'FEDCB'.split('').join(' ');
+			case '2':
+				return 'ﭲﭳﭴﭵﭶ'.split('').join(' ');
+			default:
+				return '';
+		}
+	}
+
+	static getSadaqaGlyph(): string {
+		return 'A@ ?';
+	}
+
+	private static loadTajweedFontIfNotLoaded(fontName: string, pageNumber: number): Promise<void> {
+		if (typeof document === 'undefined') return Promise.resolve();
+
+		if (!this.loadedFonts.has(fontName)) {
+			const style = document.createElement('style');
+			const page = String(pageNumber);
+			const woff2 = `${this.TAJWEED_FONT_BASE_URL}/woff2/p${page}.woff2`;
+			const woff = `${this.TAJWEED_FONT_BASE_URL}/woff/p${page}.woff`;
+			const ttf = `${this.TAJWEED_FONT_BASE_URL}/ttf/p${page}.ttf`;
+
+			style.textContent = `
+				@font-face {
+					font-family: '${fontName}';
+					src: url('${woff2}') format('woff2'),
+						url('${woff}') format('woff'),
+						url('${ttf}') format('truetype');
+					font-weight: normal;
+					font-style: normal;
+				}
+			`;
+			document.head.appendChild(style);
+			this.loadedFonts.add(fontName);
+		}
+
+		return this.waitForFontFamily(fontName);
+	}
+
+	private static extractPageNumberFromMappedFontName(fontName: string): number {
+		const match = /_p(\d+)/i.exec(fontName);
+		if (!match) return 1;
+		const pageNumber = parseInt(match[1], 10);
+		return Number.isFinite(pageNumber) && pageNumber > 0 ? pageNumber : 1;
+	}
+
+	/**
+	 * Attends une police spécifique dans le document.
+	 * @param fontFamily Le nom de la police à attendre.
+	 * @returns Une promesse qui se résout lorsque la police est chargée.
+	 */
+	private static waitForFontFamily(fontFamily: string): Promise<void> {
+		if (typeof document === 'undefined' || !('fonts' in document)) return Promise.resolve();
+		if (this.isGenericFontFamily(fontFamily)) return Promise.resolve();
+
+		const existingPromise = this.fontLoadPromises.get(fontFamily);
+		if (existingPromise) return existingPromise;
+
+		const escapedFontFamily = fontFamily.replace(/(["\\])/g, '\\$1');
+		const fontSpec = `normal 32px "${escapedFontFamily}"`;
+
+		const loadPromise = (async () => {
+			if (document.fonts.check(fontSpec)) return;
+			try {
+				const didLoad = await this.waitWithTimeout(document.fonts.load(fontSpec));
+				if (!didLoad) {
+					console.warn(`Timed out while waiting for font "${fontFamily}" before export capture.`);
+				}
+			} catch (error) {
+				console.warn(`Could not finish loading font "${fontFamily}" before capture.`, error);
+			}
+		})();
+
+		this.fontLoadPromises.set(fontFamily, loadPromise);
+		return loadPromise;
+	}
+
+	private static isGenericFontFamily(fontFamily: string): boolean {
+		return (
+			fontFamily === 'serif' ||
+			fontFamily === 'sans-serif' ||
+			fontFamily === 'monospace' ||
+			fontFamily === 'cursive' ||
+			fontFamily === 'fantasy' ||
+			fontFamily === 'system-ui' ||
+			fontFamily === 'emoji' ||
+			fontFamily === 'math' ||
+			fontFamily === 'fangsong' ||
+			fontFamily === 'ui-serif' ||
+			fontFamily === 'ui-sans-serif' ||
+			fontFamily === 'ui-monospace' ||
+			fontFamily === 'ui-rounded'
+		);
+	}
+
+	private static shouldWaitForFontFamily(fontFamily: string): boolean {
+		const normalized = fontFamily.trim().toLowerCase();
+		if (!normalized) return false;
+		if (normalized === 'inherit' || normalized === 'initial' || normalized === 'unset')
+			return false;
+
+		return true;
+	}
+
+	private static async registerSystemFontFacesIfNeeded(fontFamilies: string[]): Promise<void> {
+		if (typeof document === 'undefined') return;
+
+		const familiesToResolve = Array.from(new Set(fontFamilies)).filter((fontFamily) =>
+			this.shouldResolveSystemFontFamily(fontFamily)
+		);
+		if (familiesToResolve.length === 0) return;
+
+		for (const fontFamily of familiesToResolve) {
+			this.resolvedSystemFontFamilies.add(fontFamily);
+		}
+
+		try {
+			const sources = await invoke<SystemFontSource[]>('get_system_font_sources', {
+				fontFamilies: familiesToResolve
+			});
+
+			for (const source of sources) {
+				this.registerSystemFontFace(source);
+			}
+		} catch (error) {
+			console.warn('Could not resolve system font files before export capture.', error);
+		}
+	}
+
+	private static shouldResolveSystemFontFamily(fontFamily: string): boolean {
+		if (!fontFamily) return false;
+		if (this.loadedFonts.has(fontFamily)) return false;
+		if (this.resolvedSystemFontFamilies.has(fontFamily)) return false;
+		if (this.isGenericFontFamily(fontFamily)) return false;
+		if (this.isAppProvidedFontFamily(fontFamily)) return false;
+		return true;
+	}
+
+	private static registerSystemFontFace(source: SystemFontSource): void {
+		if (typeof document === 'undefined') return;
+		if (!source.family || !source.path) return;
+
+		const key = [
+			source.family,
+			source.path,
+			source.fontIndex,
+			source.fontWeight,
+			source.fontWeightRange ?? '',
+			source.fontStyle
+		].join('|');
+		if (this.registeredSystemFontFaces.has(key)) return;
+
+		const style = document.createElement('style');
+		style.textContent = this.getSystemFontFaceCss(source, convertFileSrc(source.path));
+		document.head.appendChild(style);
+		this.registeredSystemFontFaces.add(key);
+		this.registeredSystemFontFaceRules.set(key, { source, style });
+	}
+
+	/**
+	 * Construit une règle CSS pour une face de police système.
+	 * @param {SystemFontSource} source Métadonnées de la face.
+	 * @param {string} fontUrl URL du fichier ou du sous-ensemble.
+	 * @param {string | null | undefined} format Format CSS, ou `null` pour l'omettre.
+	 * @returns {string} Règle `@font-face` complète.
+	 */
+	private static getSystemFontFaceCss(
+		source: SystemFontSource,
+		fontUrl: string,
+		format: string | null | undefined = source.format
+	): string {
+		const formatHint = format ? ` format("${this.escapeCssString(format)}")` : '';
+		const fontWeight = this.normalizeCssFontWeight(source.fontWeight, source.fontWeightRange);
+		const fontStyle = this.normalizeCssFontStyle(source.fontStyle);
+		return `
+			@font-face {
+				font-family: "${this.escapeCssString(source.family)}";
+				src: url("${this.escapeCssString(fontUrl)}")${formatHint};
+				font-weight: ${fontWeight};
+				font-style: ${fontStyle};
+			}
+		`;
+	}
+
+	private static isAppProvidedFontFamily(fontFamily: string): boolean {
+		return (
+			fontFamily.startsWith('QCImported-') ||
+			fontFamily === 'Hafs' ||
+			fontFamily === 'IndoPak' ||
+			fontFamily === 'Soosi' ||
+			fontFamily === 'Warsh' ||
+			fontFamily === 'Reciters' ||
+			fontFamily === 'Surahs' ||
+			fontFamily === 'Surahs2' ||
+			fontFamily === 'QPC1BSML' ||
+			fontFamily === 'QPC2BSML' ||
+			fontFamily.startsWith('QPC1') ||
+			fontFamily.startsWith('QPC2') ||
+			/^p\d+-v4$/.test(fontFamily)
+		);
+	}
+
+	private static normalizeCssFontWeight(
+		fontWeight: number,
+		fontWeightRange: string | null
+	): string {
+		if (fontWeightRange && /^\d+\s+\d+$/.test(fontWeightRange)) return fontWeightRange;
+		if (!Number.isFinite(fontWeight)) return '400';
+		return String(Math.max(1, Math.min(1000, Math.round(fontWeight))));
+	}
+
+	private static normalizeCssFontStyle(fontStyle: string): string {
+		if (fontStyle === 'italic' || fontStyle === 'oblique') return fontStyle;
+		return 'normal';
+	}
+
+	private static escapeCssString(value: string): string {
+		return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\A ');
+	}
+
+	private static async waitWithTimeout(promise: Promise<unknown>): Promise<boolean> {
+		const result = await Promise.race([
+			promise.then(() => true).catch(() => false),
+			new Promise<boolean>((resolve) => setTimeout(() => resolve(false), this.FONT_WAIT_TIMEOUT_MS))
+		]);
+
+		return result;
+	}
+
+	private static async waitForNextPaint(): Promise<void> {
+		const rafOrTimeout = () =>
+			new Promise<void>((resolve) => {
+				let handled = false;
+				const id = requestAnimationFrame(() => {
+					if (!handled) {
+						handled = true;
+						resolve();
+					}
+				});
+				setTimeout(() => {
+					if (!handled) {
+						handled = true;
+						cancelAnimationFrame(id);
+						resolve();
+					}
+				}, 50);
+			});
+		await rafOrTimeout();
+		await rafOrTimeout();
+	}
+}
+
+export default QPCFontProvider;

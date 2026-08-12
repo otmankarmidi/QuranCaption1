@@ -1,0 +1,433 @@
+import {
+	Batch,
+	Utilities,
+	createDefaultBatchExportState,
+	createDefaultBatchSegmentationState,
+	createDefaultBatchStyleState,
+	type BatchDetail,
+	type BatchProjectItem
+} from '$lib/classes';
+import type { ValidatedBatchRow } from '$lib/components/batch/batchCsv';
+import { globalState } from '$lib/runes/main.svelte';
+import { ProjectService } from '$lib/services/ProjectService';
+import { pruneOrphanedQuaCache } from '$lib/services/QuaAudioCache';
+import { DEFAULT_PROJECT_TYPE } from '$lib/types/projectType';
+import { join } from '@tauri-apps/api/path';
+import { exists, readDir, readTextFile, remove, writeTextFile } from '@tauri-apps/plugin-fs';
+import { runAutoSegmentationFromImportedJsonForProject } from './autoSegmentation/run-imported';
+import {
+	classifyBatchSegmentationStatus,
+	getBatchSegmentationReviewCounts
+} from './BatchSegmentationReview';
+
+export class BatchService {
+	private static batchesFolder = 'batches/';
+
+	/**
+	 * Retourne le dossier persistant des manifestes de batch.
+	 * @returns {Promise<string>} Chemin absolu du dossier.
+	 */
+	static async getBatchesFolderPath(): Promise<string> {
+		return ProjectService.ensureFolder(this.batchesFolder);
+	}
+
+	/**
+	 * Sauvegarde un manifeste de batch.
+	 * @param {Batch} batch Batch à sauvegarder.
+	 * @returns {Promise<void>} Promesse résolue après l'écriture.
+	 */
+	static async save(batch: Batch): Promise<void> {
+		const filePath = await join(await this.getBatchesFolderPath(), `${batch.id}.json`);
+		await writeTextFile(filePath, JSON.stringify(batch.toJSON(), null, 2));
+	}
+
+	/**
+	 * Charge un manifeste de batch.
+	 * @param {number} batchId Identifiant du batch.
+	 * @param {string | undefined} interruptedError Message utilisé lors de l'ouverture du workspace.
+	 * @returns {Promise<Batch>} Batch désérialisé.
+	 */
+	static async load(batchId: number, interruptedError?: string): Promise<Batch> {
+		const filePath = await join(await this.getBatchesFolderPath(), `${batchId}.json`);
+		if (!(await exists(filePath))) throw new Error(`Batch with ID ${batchId} not found.`);
+		const batch = Batch.fromJSON(JSON.parse(await readTextFile(filePath))) as Batch;
+		if (batch.version !== 1) throw new Error(`Unsupported batch version: ${batch.version}`);
+		if (interruptedError) {
+			await this.normalizeInterruptedMedia(batch, interruptedError);
+			await this.normalizeInterruptedSegmentation(batch);
+			await this.normalizeInterruptedTranslations(batch);
+			await this.normalizeInterruptedStyle(batch);
+			await this.normalizeInterruptedExport(batch);
+		}
+		return batch;
+	}
+
+	/**
+	 * Charge tous les manifests de batch sauvegardés.
+	 * @returns {Promise<Batch[]>} Batches restaurés dans leur format courant.
+	 */
+	static async loadAll(): Promise<Batch[]> {
+		const batchesPath = await this.getBatchesFolderPath();
+		const entries = await readDir(batchesPath);
+		const batches: Batch[] = [];
+		for (const entry of entries) {
+			if (!entry.isFile || !entry.name?.endsWith('.json')) continue;
+			const batchId = Number.parseInt(entry.name.replace('.json', ''), 10);
+			if (Number.isFinite(batchId)) batches.push(await this.load(batchId));
+		}
+		return batches;
+	}
+
+	/**
+	 * Importe des manifests de batch sans écraser ceux déjà présents.
+	 * @param {Record<string, unknown>[]} batches Données Batch désérialisées du backup.
+	 * @returns {Promise<{ imported: number; skipped: number; invalid: number }>} Résultat d'import.
+	 */
+	static async importBatchesBackup(batches: Record<string, unknown>[]): Promise<{
+		imported: number;
+		skipped: number;
+		invalid: number;
+	}> {
+		if (!Array.isArray(batches)) throw new Error('Backup batches must be an array.');
+		const batchesPath = await this.getBatchesFolderPath();
+		const entries = await readDir(batchesPath);
+		const existingIds = new Set(
+			entries
+				.filter((entry) => entry.isFile && entry.name?.endsWith('.json'))
+				.map((entry) => Number.parseInt(entry.name!.replace('.json', ''), 10))
+				.filter(Number.isFinite)
+		);
+		const seenBackupIds = new Set<number>();
+		let imported = 0;
+		let skipped = 0;
+		let invalid = 0;
+		for (const rawBatch of batches) {
+			const batchId = rawBatch?.id;
+			if (typeof batchId !== 'number' || !Number.isFinite(batchId)) {
+				invalid++;
+				continue;
+			}
+			if (existingIds.has(batchId) || seenBackupIds.has(batchId)) {
+				skipped++;
+				continue;
+			}
+			try {
+				const batch = Batch.fromJSON(rawBatch) as Batch;
+				await this.save(batch);
+				existingIds.add(batchId);
+				seenBackupIds.add(batchId);
+				imported++;
+			} catch (error) {
+				console.warn(`Failed to import backup batch ${batchId}:`, error);
+				invalid++;
+			}
+		}
+		await this.loadUserBatchesDetails();
+		return { imported, skipped, invalid };
+	}
+
+	/**
+	 * Convertit les opérations média abandonnées en échecs relançables.
+	 * @param {Batch} batch Batch venant d'être chargé.
+	 * @param {string} error Message localisé à conserver dans le manifeste.
+	 * @returns {Promise<boolean>} `true` lorsqu'une sauvegarde a été nécessaire.
+	 */
+	static async normalizeInterruptedMedia(batch: Batch, error: string): Promise<boolean> {
+		let changed = false;
+		for (const project of batch.projects) {
+			if (project.media.status !== 'queued' && project.media.status !== 'processing') continue;
+			project.media.status = 'failed';
+			project.media.error = error;
+			changed = true;
+		}
+		if (changed) {
+			batch.updatedAt = new Date();
+			await this.save(batch);
+		}
+		return changed;
+	}
+
+	/**
+	 * Convertit les segmentations abandonnées en échecs relançables sans supprimer leurs clips.
+	 * @param {Batch} batch Batch venant d'être chargé.
+	 * @returns {Promise<boolean>} `true` lorsqu'une sauvegarde a été nécessaire.
+	 */
+	static async normalizeInterruptedSegmentation(batch: Batch): Promise<boolean> {
+		let changed = false;
+		for (const project of batch.projects) {
+			if (project.segmentation.status !== 'queued' && project.segmentation.status !== 'processing')
+				continue;
+			project.segmentation.status = 'failed';
+			project.segmentation.error = 'SEGMENTATION_INTERRUPTED';
+			project.segmentation.completedAt = new Date();
+			changed = true;
+		}
+		if (changed) {
+			batch.updatedAt = new Date();
+			await this.save(batch);
+		}
+		return changed;
+	}
+
+	/**
+	 * Convertit les opérations de traduction abandonnées en échecs relançables.
+	 * @param {Batch} batch Batch venant d'être chargé.
+	 * @returns {Promise<boolean>} `true` lorsqu'une sauvegarde a été nécessaire.
+	 */
+	static async normalizeInterruptedTranslations(batch: Batch): Promise<boolean> {
+		let changed = false;
+		for (const project of batch.projects) {
+			for (const state of Object.values(project.translations)) {
+				if (state.status !== 'adding' && state.status !== 'fetching') continue;
+				state.status = 'failed';
+				state.error = 'TRANSLATION_INTERRUPTED';
+				state.progress = 0;
+				changed = true;
+			}
+		}
+		if (changed) {
+			batch.updatedAt = new Date();
+			await this.save(batch);
+		}
+		return changed;
+	}
+
+	/**
+	 * Convertit une application de style abandonnée en échec relançable.
+	 * @param {Batch} batch Batch venant d'être chargé.
+	 * @returns {Promise<boolean>} `true` lorsqu'une sauvegarde a été nécessaire.
+	 */
+	static async normalizeInterruptedStyle(batch: Batch): Promise<boolean> {
+		let changed = false;
+		for (const project of batch.projects) {
+			if (project.style.status !== 'queued' && project.style.status !== 'processing') continue;
+			project.style.status = 'failed';
+			project.style.error = 'STYLE_INTERRUPTED';
+			project.style.progress = 0;
+			changed = true;
+		}
+		if (changed) {
+			batch.updatedAt = new Date();
+			await this.save(batch);
+		}
+		return changed;
+	}
+
+	/**
+	 * Convertit un export Batch abandonné en échec relançable.
+	 * @param {Batch} batch Batch venant d'être chargé.
+	 * @returns {Promise<boolean>} `true` lorsqu'une sauvegarde a été nécessaire.
+	 */
+	static async normalizeInterruptedExport(batch: Batch): Promise<boolean> {
+		let changed = false;
+		for (const project of batch.projects) {
+			if (project.export.status !== 'queued' && project.export.status !== 'processing') continue;
+			project.export.status = 'failed';
+			project.export.error = 'EXPORT_INTERRUPTED';
+			project.export.progress = 0;
+			changed = true;
+		}
+		if (changed) {
+			batch.updatedAt = new Date();
+			await this.save(batch);
+		}
+		return changed;
+	}
+
+	/**
+	 * Supprime tous les projets d'un batch puis son manifeste.
+	 * @param {number} batchId Identifiant du batch.
+	 * @returns {Promise<void>} Promesse résolue après la suppression éventuelle.
+	 */
+	static async delete(batchId: number): Promise<void> {
+		const filePath = await join(await this.getBatchesFolderPath(), `${batchId}.json`);
+		if (!(await exists(filePath))) return;
+		const batch = await this.load(batchId);
+		// Suppression concurrente : on désactive la purge par projet et on purge le
+		// cache QUA une seule fois après (évite course + rechargements O(n²)).
+		await Promise.all(
+			batch.projects.map((project) =>
+				ProjectService.delete(project.projectId, { sweepQuaCache: false })
+			)
+		);
+		await pruneOrphanedQuaCache();
+		await remove(filePath);
+		globalState.userBatchDetails = globalState.userBatchDetails.filter(
+			(detail) => detail.id !== batchId
+		);
+		if (globalState.currentBatchId === batchId) globalState.currentBatchId = null;
+		await ProjectService.loadUserProjectsDetails();
+	}
+
+	/**
+	 * Détache les projets d'un batch puis supprime uniquement son manifeste.
+	 * @param {number} batchId Identifiant du batch à dissoudre.
+	 * @returns {Promise<void>} Promesse résolue après le détachement des projets.
+	 */
+	static async dissolve(batchId: number): Promise<void> {
+		const filePath = await join(await this.getBatchesFolderPath(), `${batchId}.json`);
+		if (!(await exists(filePath))) return;
+		const batch = await this.load(batchId);
+		const projects = await Promise.all(
+			batch.projects.map((item) => ProjectService.load(item.projectId))
+		);
+		await Promise.all(
+			projects.map((project) => {
+				project.detail.batchId = null;
+				project.detail.batchOrder = null;
+				project.detail.updateTimestamp();
+				return ProjectService.save(project);
+			})
+		);
+		await remove(filePath);
+		globalState.userBatchDetails = globalState.userBatchDetails.filter(
+			(detail) => detail.id !== batchId
+		);
+		if (globalState.currentBatchId === batchId) globalState.currentBatchId = null;
+		await ProjectService.loadUserProjectsDetails();
+	}
+
+	/**
+	 * Supprime des projets d'un batch et sauvegarde son manifeste.
+	 * @param {Batch} batch Batch à modifier.
+	 * @param {number[]} projectIds Identifiants des projets à supprimer.
+	 * @returns {Promise<void>} Promesse résolue après la suppression et le rafraîchissement.
+	 */
+	static async deleteProjects(batch: Batch, projectIds: number[]): Promise<void> {
+		const selectedIds = new Set(projectIds);
+		// Purge du cache QUA une seule fois après la suppression concurrente.
+		await Promise.all(
+			batch.projects
+				.filter((project) => selectedIds.has(project.projectId))
+				.map((project) => ProjectService.delete(project.projectId, { sweepQuaCache: false }))
+		);
+		await pruneOrphanedQuaCache();
+		batch.projects = batch.projects.filter((project) => !selectedIds.has(project.projectId));
+		if (batch.selectedProjectIds !== null) {
+			batch.selectedProjectIds = batch.selectedProjectIds.filter(
+				(projectId) => !selectedIds.has(projectId)
+			);
+		}
+		batch.updatedAt = new Date();
+		await this.save(batch);
+		await Promise.all([ProjectService.loadUserProjectsDetails(), this.loadUserBatchesDetails()]);
+	}
+
+	/**
+	 * Charge les métadonnées légères de tous les batches pour la homepage.
+	 * @returns {Promise<BatchDetail[]>} Détails triés par dernière modification.
+	 */
+	static async loadUserBatchesDetails(): Promise<BatchDetail[]> {
+		try {
+			const batchesPath = await this.getBatchesFolderPath();
+			const entries = await readDir(batchesPath);
+			const details = (
+				await Promise.all(
+					entries
+						.filter((entry) => entry.isFile && entry.name?.endsWith('.json'))
+						.map(async (entry) => {
+							try {
+								const batchId = Number.parseInt(entry.name!.replace('.json', ''), 10);
+								return Number.isFinite(batchId) ? (await this.load(batchId)).toDetail() : null;
+							} catch (error) {
+								console.warn(`Impossible de charger le batch ${entry.name}:`, error);
+								return null;
+							}
+						})
+				)
+			).filter((detail): detail is BatchDetail => detail !== null);
+			details.sort((left, right) => right.updatedAt.getTime() - left.updatedAt.getTime());
+			globalState.userBatchDetails = details;
+			return details;
+		} catch {
+			globalState.userBatchDetails = [];
+			return [];
+		}
+	}
+
+	/**
+	 * Crée les projets validés puis leur manifeste, avec rollback en cas d'échec.
+	 * @param {string} name Nom validé du batch.
+	 * @param {ValidatedBatchRow[]} rows Lignes CSV validées dans leur ordre d'origine.
+	 * @returns {Promise<Batch>} Batch créé et sauvegardé.
+	 */
+	static async createBatch(name: string, rows: ValidatedBatchRow[]): Promise<Batch> {
+		const batch = new Batch(name.trim());
+		const batchesPath = await this.getBatchesFolderPath();
+		while (await exists(await join(batchesPath, `${batch.id}.json`))) {
+			batch.id = Utilities.randomId();
+		}
+		const createdProjectIds: number[] = [];
+
+		try {
+			for (const row of rows) {
+				const project = await ProjectService.createEmptyProject({
+					name: row.projectName,
+					reciter: row.reciter,
+					projectType: DEFAULT_PROJECT_TYPE,
+					batchId: batch.id,
+					batchOrder: row.order
+				});
+				createdProjectIds.push(project.detail.id);
+				const segmentation = createDefaultBatchSegmentationState();
+				if (row.segmentationJsonPath) {
+					const startedAt = new Date();
+					const settings = globalState.settings?.autoSegmentationSettings;
+					const result = await runAutoSegmentationFromImportedJsonForProject(
+						project,
+						await readTextFile(row.segmentationJsonPath),
+						{
+							fillBySilence: settings?.fillBySilence,
+							extendBeforeSilence: settings?.extendBeforeSilence,
+							extendBeforeSilenceMs: settings?.extendBeforeSilenceMs
+						}
+					);
+					if (!result || result.status !== 'completed') {
+						throw new Error(
+							result?.status === 'failed' ? result.message : 'SEGMENTATION_JSON_IMPORT_FAILED'
+						);
+					}
+					const review = getBatchSegmentationReviewCounts(project);
+					segmentation.status = classifyBatchSegmentationStatus('not_started', review);
+					segmentation.progress = 100;
+					segmentation.segmentsApplied = result.segmentsApplied;
+					segmentation.review = review;
+					segmentation.startedAt = startedAt;
+					segmentation.completedAt = new Date();
+					project.detail.updateTimestamp();
+					await ProjectService.save(project);
+				}
+				const item: BatchProjectItem = {
+					order: row.order,
+					projectId: project.detail.id,
+					projectName: row.projectName,
+					reciter: row.reciter,
+					source: row.batchSource,
+					media: {
+						status: 'pending',
+						progress: 0,
+						error: null,
+						resolvedAssetPath: null,
+						mode: null,
+						assetId: null
+					},
+					segmentation,
+					translations: {},
+					style: createDefaultBatchStyleState(),
+					export: createDefaultBatchExportState()
+				};
+				batch.projects.push(item);
+			}
+
+			await this.save(batch);
+			await Promise.all([ProjectService.loadUserProjectsDetails(), this.loadUserBatchesDetails()]);
+			return batch;
+		} catch (error) {
+			await Promise.allSettled(
+				createdProjectIds.map((projectId) => ProjectService.delete(projectId))
+			);
+			await this.delete(batch.id).catch(() => undefined);
+			throw error;
+		}
+	}
+}
