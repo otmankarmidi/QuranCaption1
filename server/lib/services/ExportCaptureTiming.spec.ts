@@ -1,0 +1,776 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+	calculateCaptureTimingsForRange,
+	buildExportCaptureJobPlan,
+	getExportWordByWordHighlightTimings,
+	getExportWordByWordHiddenArabicTimings,
+	getTimedOverlayStateAt,
+	hasBlankImg,
+	hasTiming,
+	resolveCurrentSurahFromClips,
+	type ExportSubtitleCaptureClip,
+	type ExportSubtitleWbwSourceClip,
+	type ExportTimedOverlayCaptureClip
+} from '$lib/services/ExportCaptureTiming';
+
+function subtitle(
+	startTime: number,
+	endTime: number,
+	surah: number,
+	visualMergeGroupId: string | null = null,
+	visualMergeMode: ExportSubtitleCaptureClip['visualMergeMode'] = null,
+	wbwHighlightTimings?: number[],
+	wbwHiddenArabicTimings?: number[]
+): ExportSubtitleCaptureClip {
+	return {
+		startTime,
+		endTime,
+		surah,
+		kind: 'subtitle',
+		visualMergeGroupId,
+		visualMergeMode,
+		wbwHighlightTimings,
+		wbwHiddenArabicTimings
+	};
+}
+
+function silence(startTime: number, endTime: number): ExportSubtitleCaptureClip {
+	return { startTime, endTime, kind: 'silence' };
+}
+
+function predefined(startTime: number, endTime: number): ExportSubtitleCaptureClip {
+	return { startTime, endTime, kind: 'predefined' };
+}
+
+function customText(
+	id: number,
+	startTime: number | null,
+	endTime: number | null,
+	alwaysShow: boolean = false
+): ExportTimedOverlayCaptureClip {
+	return {
+		id,
+		startTime,
+		endTime,
+		alwaysShow,
+		captureBoundariesWhenAlwaysShow: true
+	};
+}
+
+function timedOverlay(
+	id: string,
+	startTime: number | null,
+	endTime: number | null,
+	alwaysShow: boolean = false,
+	isVisibleAt?: (timing: number) => boolean
+): ExportTimedOverlayCaptureClip {
+	return {
+		id,
+		startTime,
+		endTime,
+		alwaysShow,
+		isVisibleAt
+	};
+}
+
+function blankKey(surah: number, overlays: string = ''): string {
+	return `surah:${surah}|overlays:${overlays}`;
+}
+
+function calculateTimings(
+	subtitleClips: ExportSubtitleCaptureClip[],
+	timedOverlayClips: ExportTimedOverlayCaptureClip[] = [],
+	rangeStart: number = 0,
+	rangeEnd: number = 5_000,
+	fadeDuration: number = 200
+) {
+	return calculateCaptureTimingsForRange({
+		rangeStart,
+		rangeEnd,
+		fadeDuration,
+		subtitleClips,
+		timedOverlayClips,
+		getCurrentSurah: (time) => resolveCurrentSurahFromClips(subtitleClips, time)
+	});
+}
+
+describe('resolveCurrentSurahFromClips', () => {
+	it('returns the active subtitle surah when the cursor is inside a subtitle', () => {
+		expect(resolveCurrentSurahFromClips([subtitle(0, 500, 1)], 250)).toBe(1);
+	});
+
+	it('returns the previous subtitle surah when the cursor is inside a silence clip', () => {
+		const clips = [subtitle(0, 500, 1), silence(501, 800), subtitle(801, 1200, 4)];
+		expect(resolveCurrentSurahFromClips(clips, 650)).toBe(1);
+	});
+
+	it('returns the next subtitle surah when the cursor is before the first subtitle', () => {
+		expect(resolveCurrentSurahFromClips([subtitle(100, 500, 36)], 50)).toBe(36);
+	});
+
+	it('returns the previous subtitle surah for decimal holes instead of the last surah in the project', () => {
+		const clips = [
+			subtitle(273.50427350427356, 307.49, 1),
+			subtitle(309.01, 4239.49, 1),
+			subtitle(30_000, 31_000, 112)
+		];
+
+		expect(resolveCurrentSurahFromClips(clips, 308)).toBe(1);
+	});
+
+	it('returns the next subtitle surah when the current non-subtitle clip has no previous subtitle', () => {
+		const clips = [predefined(0, 100), subtitle(101, 400, 55)];
+		expect(resolveCurrentSurahFromClips(clips, 50)).toBe(55);
+	});
+
+	it('returns the last subtitle surah after the final clip', () => {
+		const clips = [subtitle(0, 500, 1), subtitle(1_000, 1_500, 112)];
+		expect(resolveCurrentSurahFromClips(clips, 2_000)).toBe(112);
+	});
+
+	it('returns -1 when there is no subtitle at all', () => {
+		expect(resolveCurrentSurahFromClips([silence(0, 500), predefined(600, 700)], 650)).toBe(-1);
+	});
+});
+
+describe('buildExportCaptureJobPlan', () => {
+	it('separates blank source captures from numbered blank copies', () => {
+		const key = blankKey(1);
+		const plan = buildExportCaptureJobPlan({
+			timings: {
+				uniqueSorted: [0, 800, 1_000],
+				imgWithNothingShown: { [key]: 800 },
+				blankImgs: { [key]: [1_000] },
+				duplicableTimings: new Map(),
+				exactCaptureTimings: new Set(),
+				exactCaptureTimingValues: new Map()
+			},
+			rangeStart: 0,
+			rangeEnd: 1_000,
+			fadeDuration: 100,
+			workerCount: 4,
+			isBlankCaptureTiming: (timing) => timing >= 800,
+			getReusableBlankFileName: () => null
+		});
+
+		expect(plan.blankSourceJobs).toEqual([
+			{
+				kind: 'blankSource',
+				timing: 800,
+				captureTiming: 800,
+				fileName: 'blank_surah%3A1%7Coverlays%3A',
+				blankVisualStateKey: key
+			}
+		]);
+		expect(plan.copyJobs).toEqual([
+			{
+				kind: 'copy',
+				timing: 1_000,
+				sourceFileName: 'blank_surah%3A1%7Coverlays%3A',
+				targetFileName: 1_100,
+				reason: 'blank'
+			}
+		]);
+		expect(plan.blankImageIndexes).toEqual([800, 1_100]);
+	});
+
+	it('runs duplicable timing copies after their capture source can exist', () => {
+		const plan = buildExportCaptureJobPlan({
+			timings: {
+				uniqueSorted: [0, 200, 800],
+				imgWithNothingShown: {},
+				blankImgs: {},
+				duplicableTimings: new Map([[800, 200]]),
+				exactCaptureTimings: new Set(),
+				exactCaptureTimingValues: new Map()
+			},
+			rangeStart: 0,
+			rangeEnd: 1_000,
+			fadeDuration: 100,
+			workerCount: 4,
+			isBlankCaptureTiming: () => false,
+			getReusableBlankFileName: () => null
+		});
+
+		expect(plan.captureJobs.map((job) => job.timing)).toEqual([0, 200]);
+		expect(plan.copyJobs).toEqual([
+			{
+				kind: 'copy',
+				timing: 800,
+				sourceFileName: '200',
+				targetFileName: 900,
+				reason: 'duplicable'
+			}
+		]);
+		expect(plan.captureJobs.map((job) => job.fileName)).toContain(plan.copyJobs[0].sourceFileName);
+	});
+
+	it('splits capture jobs into stable temporal quarters', () => {
+		const plan = buildExportCaptureJobPlan({
+			timings: {
+				uniqueSorted: [0, 100, 200, 300, 400, 500, 600, 700],
+				imgWithNothingShown: {},
+				blankImgs: {},
+				duplicableTimings: new Map(),
+				exactCaptureTimings: new Set(),
+				exactCaptureTimingValues: new Map()
+			},
+			rangeStart: 0,
+			rangeEnd: 800,
+			fadeDuration: 0,
+			workerCount: 4,
+			isBlankCaptureTiming: () => false,
+			getReusableBlankFileName: () => null
+		});
+
+		expect(plan.workerBuckets.map((bucket) => bucket.map((job) => job.timing))).toEqual([
+			[0, 100],
+			[200, 300],
+			[400, 500],
+			[600, 700]
+		]);
+	});
+});
+
+describe('getTimedOverlayStateAt', () => {
+	it('ignores always-show overlays and sorts timed overlays for a stable signature', () => {
+		const clips = [
+			customText(7, 0, 500, true),
+			customText(2, 0, 500),
+			timedOverlay('surah-name', 100, 400)
+		];
+
+		expect(getTimedOverlayStateAt(200, clips)).toBe('2-0-500|surah-name-100-400');
+	});
+
+	it('returns an empty signature when no timed overlay is visible', () => {
+		expect(getTimedOverlayStateAt(900, [customText(1, 0, 500)])).toBe('');
+	});
+
+	it('respects isVisibleAt for overlays like verse number', () => {
+		const verseNumber = timedOverlay('verse-number', 0, 1_000, false, (timing) => timing >= 200);
+		expect(getTimedOverlayStateAt(100, [verseNumber])).toBe('');
+		expect(getTimedOverlayStateAt(300, [verseNumber])).toBe('verse-number-0-1000');
+	});
+});
+
+describe('getExportWordByWordHighlightTimings', () => {
+	it('does not add invisible intermediate captures when current-word-only is disabled', () => {
+		const clip: ExportSubtitleWbwSourceClip = {
+			id: 1,
+			startTime: 0,
+			endTime: 1_000,
+			visualMergeGroupId: null,
+			visualMergeMode: null,
+			alignmentMetadata: {
+				timeFrom: 0,
+				words: [
+					{ location: '1:1:1', start: 0.1, end: 0.4 },
+					{ location: '1:1:2', start: 0.7, end: 0.9 }
+				]
+			}
+		};
+
+		expect(
+			getExportWordByWordHighlightTimings({
+				clip,
+				subtitleClips: [clip],
+				isWbwEnabledForClipId: () => true,
+				isShowCurrentWordOnlyEnabledForClipId: () => false
+			})
+		).toEqual([100, 700]);
+	});
+
+	it('adds visible word captures and invisible intermediate captures in current-word-only mode', () => {
+		const clip: ExportSubtitleWbwSourceClip = {
+			id: 1,
+			startTime: 0,
+			endTime: 1_000,
+			visualMergeGroupId: null,
+			visualMergeMode: null,
+			alignmentMetadata: {
+				timeFrom: 0,
+				words: [
+					{ location: '1:1:1', start: 0.1, end: 0.4 },
+					{ location: '1:1:2', start: 0.7, end: 0.9 }
+				]
+			}
+		};
+
+		expect(
+			getExportWordByWordHighlightTimings({
+				clip,
+				subtitleClips: [clip],
+				isWbwEnabledForClipId: () => true,
+				isShowCurrentWordOnlyEnabledForClipId: () => true
+			})
+		).toEqual([100, 400, 700]);
+		expect(
+			getExportWordByWordHiddenArabicTimings({
+				clip,
+				subtitleClips: [clip],
+				isWbwEnabledForClipId: () => true,
+				isShowCurrentWordOnlyEnabledForClipId: () => true
+			})
+		).toEqual([400]);
+	});
+
+	it('keeps a hidden arabic capture when a word ends exactly as the next one starts', () => {
+		const clip: ExportSubtitleWbwSourceClip = {
+			id: 1,
+			startTime: 0,
+			endTime: 1_000,
+			visualMergeGroupId: null,
+			visualMergeMode: null,
+			alignmentMetadata: {
+				timeFrom: 0,
+				words: [
+					{ location: '1:1:1', start: 0.1, end: 0.4 },
+					{ location: '1:1:2', start: 0.4, end: 0.7 }
+				]
+			}
+		};
+
+		expect(
+			getExportWordByWordHiddenArabicTimings({
+				clip,
+				subtitleClips: [clip],
+				isWbwEnabledForClipId: () => true,
+				isShowCurrentWordOnlyEnabledForClipId: () => true
+			})
+		).toEqual([400]);
+	});
+
+	it('keeps current-word-only timings sorted, unique and bounded to the source clip', () => {
+		const clip: ExportSubtitleWbwSourceClip = {
+			id: 1,
+			startTime: 1_000,
+			endTime: 2_000,
+			visualMergeGroupId: null,
+			visualMergeMode: null,
+			alignmentMetadata: {
+				timeFrom: 1,
+				words: [
+					{ location: '1:1:1', start: -0.1, end: 0.2 },
+					{ location: '1:1:2', start: 0.2, end: 0.4 },
+					{ location: '1:1:3', start: 0.6, end: 1.3 }
+				]
+			}
+		};
+
+		expect(
+			getExportWordByWordHighlightTimings({
+				clip,
+				subtitleClips: [clip],
+				isWbwEnabledForClipId: () => true,
+				isShowCurrentWordOnlyEnabledForClipId: () => true
+			})
+		).toEqual([1_200, 1_400, 1_600]);
+		expect(
+			getExportWordByWordHiddenArabicTimings({
+				clip,
+				subtitleClips: [clip],
+				isWbwEnabledForClipId: () => true,
+				isShowCurrentWordOnlyEnabledForClipId: () => true
+			})
+		).toEqual([1_200, 1_400]);
+	});
+
+	it('respects current-word-only overrides per clip', () => {
+		const firstClip: ExportSubtitleWbwSourceClip = {
+			id: 1,
+			startTime: 0,
+			endTime: 1_000,
+			visualMergeGroupId: null,
+			visualMergeMode: null,
+			alignmentMetadata: {
+				timeFrom: 0,
+				words: [
+					{ location: '1:1:1', start: 0.1, end: 0.3 },
+					{ location: '1:1:2', start: 0.5, end: 0.7 }
+				]
+			}
+		};
+		const secondClip: ExportSubtitleWbwSourceClip = {
+			id: 2,
+			startTime: 1_000,
+			endTime: 2_000,
+			visualMergeGroupId: null,
+			visualMergeMode: null,
+			alignmentMetadata: {
+				timeFrom: 1,
+				words: [
+					{ location: '1:2:1', start: 0.1, end: 0.3 },
+					{ location: '1:2:2', start: 0.5, end: 0.7 }
+				]
+			}
+		};
+		const showCurrentWordOnlyClipIds = new Set([2]);
+
+		const getTimings = (clip: ExportSubtitleWbwSourceClip) =>
+			getExportWordByWordHighlightTimings({
+				clip,
+				subtitleClips: [firstClip, secondClip],
+				isWbwEnabledForClipId: () => true,
+				isShowCurrentWordOnlyEnabledForClipId: (clipId) => showCurrentWordOnlyClipIds.has(clipId)
+			});
+
+		expect(getTimings(firstClip)).toEqual([100, 500]);
+		expect(getTimings(secondClip)).toEqual([1_100, 1_300, 1_500]);
+	});
+
+	it('does not mutate subtitle clips when preparing WBW export timings', () => {
+		const clip: ExportSubtitleWbwSourceClip = {
+			id: 1,
+			startTime: 0,
+			endTime: 1_000,
+			visualMergeGroupId: null,
+			visualMergeMode: null,
+			alignmentMetadata: {
+				timeFrom: 0,
+				words: [
+					{ location: '1:1:1', start: 0.1, end: 0.4 },
+					{ location: '1:1:2', start: 0.7, end: 0.9 }
+				]
+			}
+		};
+		const subtitleClips = [clip];
+		const before = JSON.stringify(subtitleClips);
+
+		getExportWordByWordHighlightTimings({
+			clip,
+			subtitleClips,
+			isWbwEnabledForClipId: () => true,
+			isShowCurrentWordOnlyEnabledForClipId: () => true
+		});
+
+		expect(JSON.stringify(subtitleClips)).toBe(before);
+		expect(subtitleClips).toHaveLength(1);
+		expect(subtitleClips[0]).toBe(clip);
+	});
+});
+
+describe('calculateCaptureTimingsForRange', () => {
+	it('reuses the fade-out screenshot when timed overlay visibility is unchanged across the subtitle', () => {
+		const result = calculateTimings([subtitle(0, 1_000, 1)], [customText(9, 0, 2_000)]);
+
+		expect(result.uniqueSorted).toEqual([0, 200, 1_000, 1_800, 2_000, 5_000]);
+		expect(result.duplicableTimings).toEqual(new Map([[800, 200]]));
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1, '9-0-2000')]: 1_000 });
+		expect(result.blankImgs).toEqual({});
+	});
+
+	it('keeps distinct fade-in and fade-out captures when timed overlay visibility changes mid-subtitle', () => {
+		const result = calculateTimings([subtitle(0, 1_000, 1)], [customText(9, 0, 300)]);
+
+		expect(result.uniqueSorted).toEqual([0, 100, 200, 300, 800, 1_000, 5_000]);
+		expect(result.duplicableTimings.size).toBe(0);
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1)]: 1_000 });
+	});
+
+	it('captures the next subtitle instead of duplicating the previous one when fade is disabled', () => {
+		const result = calculateTimings(
+			[subtitle(0, 1_000, 1), subtitle(1_000, 2_000, 1)],
+			[],
+			0,
+			3_000,
+			0
+		);
+
+		expect(result.uniqueSorted).toEqual([0, 1_000, 2_000, 3_000]);
+		expect(result.duplicableTimings.size).toBe(0);
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1)]: 2_000 });
+		expect(result.blankImgs).toEqual({});
+	});
+
+	it('registers a reusable blank at touching subtitle boundaries when fade is enabled', () => {
+		const result = calculateTimings([subtitle(0, 500, 1), subtitle(500, 1_000, 1)]);
+
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1)]: 500 });
+		expect(result.blankImgs[blankKey(1)]).toEqual([1_000]);
+	});
+
+	it('creates one reusable blank image per surah and reuses it for later subtitles of the same surah', () => {
+		const result = calculateTimings([subtitle(0, 500, 1), subtitle(1_000, 1_500, 1)]);
+
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1)]: 500 });
+		expect(result.blankImgs).toEqual({ [blankKey(1)]: [1_500] });
+	});
+
+	it('groups reusable blank images by surah', () => {
+		const result = calculateTimings([subtitle(0, 500, 1), subtitle(1_000, 1_500, 112)]);
+
+		expect(result.imgWithNothingShown).toEqual({
+			[blankKey(1)]: 500,
+			[blankKey(112)]: 1_500
+		});
+		expect(result.blankImgs).toEqual({});
+	});
+
+	it('reuses an existing blank image during silence clips on the same surah', () => {
+		const result = calculateTimings([subtitle(0, 500, 1), silence(501, 900)]);
+
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1)]: 500 });
+		expect(result.blankImgs[blankKey(1)]).toEqual([900]);
+		expect(hasTiming(result.blankImgs, 900)).toEqual({
+			hasIt: true,
+			key: blankKey(1),
+			surah: 1
+		});
+		expect(hasBlankImg(result.imgWithNothingShown, 1)).toBe(true);
+	});
+
+	it('registers a separate blank image state when a timed overlay is still visible at subtitle end', () => {
+		const result = calculateTimings([subtitle(0, 500, 1)], [customText(3, 100, 700)]);
+
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1, '3-100-700')]: 500 });
+		expect(result.blankImgs).toEqual({});
+	});
+
+	it('captures blanks instead of reusing them while a subtitle background overlay is visible', () => {
+		const result = calculateTimings(
+			[subtitle(0, 500, 1), subtitle(900, 1_200, 1)],
+			[
+				{
+					id: 'arabic-background-container',
+					startTime: 100,
+					endTime: 1_000,
+					alwaysShow: false,
+					preventBlankReuse: true
+				}
+			]
+		);
+
+		expect(result.uniqueSorted).toContain(500);
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1)]: 1_200 });
+		expect(result.blankImgs).toEqual({});
+		expect(hasTiming(result.blankImgs, 500)).toEqual({ hasIt: false, key: null, surah: null });
+	});
+
+	it('does register a blank image when the overlapping overlay is always-show', () => {
+		const result = calculateTimings([subtitle(0, 500, 1)], [customText(3, 100, 700, true)]);
+
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1, '3-100-700')]: 500 });
+	});
+
+	it('does not create or reuse a blank at an internal arabic merge transition', () => {
+		const result = calculateTimings([
+			subtitle(0, 500, 1, 'merge-1', 'arabic'),
+			subtitle(501, 1_000, 1, 'merge-1', 'arabic')
+		]);
+
+		expect(result.uniqueSorted).toContain(500);
+		expect(result.exactCaptureTimings).toEqual(new Set([500]));
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1)]: 1_000 });
+		expect(result.blankImgs).toEqual({});
+		expect(hasTiming(result.blankImgs, 500)).toEqual({ hasIt: false, key: null, surah: null });
+	});
+
+	it('does not create or reuse a blank at an internal translation merge transition', () => {
+		const result = calculateTimings([
+			subtitle(0, 500, 1, 'merge-1', 'translation'),
+			subtitle(501, 1_000, 1, 'merge-1', 'translation')
+		]);
+
+		expect(result.uniqueSorted).toContain(500);
+		expect(result.exactCaptureTimings).toEqual(new Set([500]));
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1)]: 1_000 });
+		expect(result.blankImgs).toEqual({});
+	});
+
+	it('keeps the exact cursor time for decimal internal translation merge transitions', () => {
+		const result = calculateTimings([
+			subtitle(0, 500.4, 1, 'merge-1', 'translation'),
+			subtitle(501, 1_000, 1, 'merge-1', 'translation')
+		]);
+
+		expect(result.uniqueSorted).toContain(500);
+		expect(result.exactCaptureTimings).toEqual(new Set([500]));
+		expect(result.exactCaptureTimingValues.get(500)).toBe(500.4);
+	});
+
+	it('does not capture an internal full merge transition', () => {
+		const result = calculateTimings([
+			subtitle(0, 500, 1, 'merge-1', 'both'),
+			subtitle(501, 1_000, 1, 'merge-1', 'both')
+		]);
+
+		expect(result.uniqueSorted).not.toContain(500);
+		expect(result.exactCaptureTimings).toEqual(new Set());
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1)]: 1_000 });
+		expect(result.blankImgs).toEqual({});
+	});
+
+	it('keeps internal merged transitions as real captures across a three-clip group', () => {
+		const result = calculateTimings([
+			subtitle(0, 500, 1, 'merge-1', 'arabic'),
+			subtitle(501, 1_000, 1, 'merge-1', 'arabic'),
+			subtitle(1_001, 1_500, 1, 'merge-1', 'arabic')
+		]);
+
+		expect(result.uniqueSorted).toContain(500);
+		expect(result.uniqueSorted).toContain(1_000);
+		expect(result.exactCaptureTimings).toEqual(new Set([500, 1_000]));
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1)]: 1_500 });
+		expect(result.blankImgs).toEqual({});
+		expect(hasTiming(result.blankImgs, 500)).toEqual({ hasIt: false, key: null, surah: null });
+		expect(hasTiming(result.blankImgs, 1_000)).toEqual({ hasIt: false, key: null, surah: null });
+	});
+
+	it('forces a real capture for the no-translation frame inside an arabic merge transition', () => {
+		const result = calculateTimings([
+			subtitle(0, 500, 1, 'merge-1', 'arabic'),
+			subtitle(501, 1_000, 1, 'merge-1', 'arabic')
+		]);
+
+		expect(result.uniqueSorted).toContain(500);
+		expect(result.exactCaptureTimings.has(500)).toBe(true);
+		expect(result.imgWithNothingShown[blankKey(1)]).toBe(1_000);
+		expect(hasTiming(result.blankImgs, 500)).toEqual({ hasIt: false, key: null, surah: null });
+	});
+
+	it('adds only boundary screenshots for always-show custom texts', () => {
+		const result = calculateTimings([], [customText(5, 100, 700, true)], 0, 1_000);
+
+		expect(result.uniqueSorted).toEqual([0, 100, 700, 1_000]);
+	});
+
+	it('adds fade-in, fade-out and end screenshots for timed custom texts', () => {
+		const result = calculateTimings([], [customText(5, 100, 800)], 0, 1_000, 200);
+
+		expect(result.uniqueSorted).toEqual([0, 300, 600, 800, 1_000]);
+	});
+
+	it('clips timings to the requested export range and rounds decimal captures', () => {
+		const result = calculateTimings([subtitle(90.6, 120.4, 1)], [], 100, 121, 50);
+
+		expect(result.uniqueSorted).toEqual([100, 120, 121]);
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1)]: 120 });
+	});
+
+	it('ignores invalid or zero-length clips', () => {
+		const result = calculateTimings(
+			[subtitle(0, 0, 1), subtitle(100, 100, 2), subtitle(200, 400, 3)],
+			[customText(1, 500, 500)],
+			0,
+			1_000,
+			100
+		);
+
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(3)]: 400 });
+		expect(result.uniqueSorted).toEqual([0, 300, 400, 1_000]);
+	});
+
+	it('allows duplication when a timed global overlay stays visible for the whole subtitle', () => {
+		const result = calculateTimings(
+			[subtitle(0, 1_000, 1)],
+			[timedOverlay('surah-name', 0, 2_000)]
+		);
+
+		expect(result.duplicableTimings).toEqual(new Map([[800, 200]]));
+	});
+
+	it('prevents duplication when a timed global overlay changes state during the subtitle', () => {
+		const result = calculateTimings(
+			[subtitle(0, 1_000, 1)],
+			[timedOverlay('reciter-name', 0, 300)]
+		);
+
+		expect(result.duplicableTimings.size).toBe(0);
+		expect(result.uniqueSorted).toEqual([0, 100, 200, 300, 800, 1_000, 5_000]);
+	});
+
+	it('creates a separate blank image state when a timed global overlay is visible at subtitle end', () => {
+		const result = calculateTimings([subtitle(0, 500, 1)], [timedOverlay('surah-name', 100, 700)]);
+
+		expect(result.imgWithNothingShown).toEqual({
+			[blankKey(1, 'surah-name-100-700')]: 500
+		});
+		expect(result.blankImgs).toEqual({});
+	});
+
+	it('combines custom overlays and global overlays in duplication decisions', () => {
+		const result = calculateTimings(
+			[subtitle(0, 1_000, 1)],
+			[customText(1, 0, 2_000), timedOverlay('surah-name', 0, 2_000)]
+		);
+
+		expect(result.duplicableTimings).toEqual(new Map([[800, 200]]));
+	});
+
+	it('keeps verse number hidden outside subtitle-active timings even inside its global timed range', () => {
+		const result = calculateTimings(
+			[subtitle(0, 500, 1), silence(501, 900)],
+			[timedOverlay('verse-number', 0, 1_000, false, (timing) => timing >= 0 && timing <= 500)]
+		);
+
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1)]: 500 });
+		expect(result.blankImgs).toEqual({ [blankKey(1)]: [900] });
+	});
+
+	it('keeps duplicate blank timings in uniqueSorted so numeric PNG files are generated', () => {
+		const result = calculateTimings(
+			[subtitle(501, 10_161, 1), silence(10_162, 11_170), subtitle(11_171, 20_000, 1)],
+			[],
+			0,
+			21_000,
+			900
+		);
+
+		expect(result.uniqueSorted).toEqual(expect.arrayContaining([1_401, 10_161, 11_170, 12_071]));
+		expect(result.imgWithNothingShown).toEqual({ [blankKey(1)]: 10_161 });
+		expect(result.blankImgs[blankKey(1)]).toContain(11_170);
+	});
+
+	it('marks current-word-only intermediate captures to hide only arabic text', () => {
+		const result = calculateTimings([subtitle(0, 1_000, 1, null, null, [100, 400, 700], [400])]);
+		const plan = buildExportCaptureJobPlan({
+			timings: result,
+			rangeStart: 0,
+			rangeEnd: 1_000,
+			fadeDuration: 100,
+			workerCount: 1,
+			isBlankCaptureTiming: (timing) =>
+				hasTiming(result.blankImgs, timing).hasIt ||
+				Object.values(result.imgWithNothingShown).includes(timing),
+			getReusableBlankFileName: () => null
+		});
+
+		expect(plan.captureJobs).toContainEqual(
+			expect.objectContaining({
+				kind: 'capture',
+				timing: 400,
+				captureTiming: 400,
+				isBlankImage: false,
+				hideArabicText: true
+			})
+		);
+		expect(result.hiddenArabicTextTimings).toEqual(new Set([400]));
+		expect(hasTiming(result.blankImgs, 400)).toEqual({ hasIt: false, key: null, surah: null });
+		expect(Object.values(result.imgWithNothingShown)).not.toContain(400);
+	});
+
+	it('keeps both hidden-arabic and visible-word captures when they share the same timing', () => {
+		const result = calculateTimings([subtitle(0, 1_000, 1, null, null, [100, 400, 700], [400])]);
+		const plan = buildExportCaptureJobPlan({
+			timings: result,
+			rangeStart: 0,
+			rangeEnd: 1_000,
+			fadeDuration: 250,
+			workerCount: 1,
+			isBlankCaptureTiming: (timing) =>
+				hasTiming(result.blankImgs, timing).hasIt ||
+				Object.values(result.imgWithNothingShown).includes(timing),
+			getReusableBlankFileName: () => null
+		});
+		const jobsAt400 = plan.captureJobs.filter((job) => job.timing === 400);
+
+		expect(jobsAt400).toEqual([
+			expect.objectContaining({ timing: 400, captureTiming: 400, hideArabicText: true }),
+			expect.objectContaining({ timing: 400, captureTiming: 401, hideArabicText: false })
+		]);
+		expect(jobsAt400[1].imageIndex - jobsAt400[0].imageIndex).toBe(500);
+		expect(plan.captureJobs.find((job) => job.timing === 700)?.imageIndex).toBe(1_700);
+	});
+});

@@ -1,0 +1,373 @@
+import { describe, expect, it, vi } from 'vitest';
+
+vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn() }));
+vi.mock('@tauri-apps/plugin-fs', () => ({ exists: vi.fn() }));
+
+import {
+	Batch,
+	createDefaultBatchSegmentationState,
+	createDefaultBatchExportState,
+	createDefaultBatchStyleState,
+	TrackType,
+	VerseRange,
+	type BatchProjectItem
+} from '$lib/classes';
+import type { Project } from '$lib/classes/Project';
+import { globalState } from '$lib/runes/main.svelte';
+import { AutoSegmentationExecutionCoordinator } from '$lib/services/AutoSegmentationExecutionCoordinator';
+import {
+	BatchSegmentationService,
+	reconcileBatchSegmentations,
+	type BatchSegmentationQueueProgress
+} from '$lib/services/BatchSegmentationService';
+import type { BatchSegmentationRunConfiguration } from '$lib/services/BatchSegmentationSettings';
+import { BatchService } from '$lib/services/BatchService';
+import { ProjectService } from '$lib/services/ProjectService';
+
+interface Deferred<T> {
+	promise: Promise<T>;
+	resolve: (value: T) => void;
+	reject: (reason: Error) => void;
+}
+
+/**
+ * Crée une promesse contrôlée sans délai arbitraire.
+ * @returns {Deferred<T>} Promesse et contrôleurs.
+ */
+function deferred<T>(): Deferred<T> {
+	let resolve!: (value: T) => void;
+	let reject!: (reason: Error) => void;
+	const promise = new Promise<T>((promiseResolve, promiseReject) => {
+		resolve = promiseResolve;
+		reject = promiseReject;
+	});
+	return { promise, resolve, reject };
+}
+
+/**
+ * Construit un projet Batch prêt pour la segmentation.
+ * @param {number} order Ordre du projet.
+ * @returns {BatchProjectItem} Ligne Batch minimale.
+ */
+function createItem(order: number): BatchProjectItem {
+	return {
+		order,
+		projectId: order,
+		projectName: `Project ${order}`,
+		reciter: 'Reciter',
+		source: { kind: 'url', value: `https://example.com/${order}` },
+		media: {
+			status: 'completed',
+			progress: 100,
+			error: null,
+			resolvedAssetPath: `/audio/${order}.mp3`,
+			mode: 'audio_only',
+			assetId: order
+		},
+		segmentation: createDefaultBatchSegmentationState(),
+		translations: {},
+		style: createDefaultBatchStyleState(),
+		export: createDefaultBatchExportState()
+	};
+}
+
+const configuration = {
+	snapshot: Object.freeze({
+		runtime: 'api',
+		mode: 'multi_aligner',
+		model: 'Base',
+		device: null,
+		includeWbwTimestamps: false,
+		minSilenceMs: 200,
+		minSpeechMs: 1000,
+		padMs: 100,
+		fillBySilence: true,
+		extendBeforeSilence: false,
+		extendBeforeSilenceMs: 0,
+		surahSplitterSurah: null
+	}),
+	mode: 'api',
+	options: Object.freeze({})
+} satisfies BatchSegmentationRunConfiguration;
+
+const localConfiguration = {
+	...configuration,
+	snapshot: Object.freeze({ ...configuration.snapshot, runtime: 'local' }),
+	mode: 'local'
+} satisfies BatchSegmentationRunConfiguration;
+
+describe('BatchSegmentationService', () => {
+	it('runs sequentially, continues after failure and always releases its listener and lock', async () => {
+		const items = [createItem(2), createItem(1), createItem(3)];
+		const controls = new Map(items.map((item) => [item.projectId, deferred<void>()]));
+		const started: number[] = [];
+		let active = 0;
+		let maximumActive = 0;
+		const saves: string[] = [];
+		let latestProgress: BatchSegmentationQueueProgress | null = null;
+		const unlisten = vi.fn();
+		const service = new BatchSegmentationService({
+			listenStatus: async () => unlisten,
+			onUpdate: (_item, _activity, progress) => {
+				latestProgress = progress;
+			},
+			saveBatch: async (batch) => {
+				saves.push(batch.projects.map((item) => item.segmentation.status).join(','));
+			},
+			processItem: async (item) => {
+				started.push(item.projectId);
+				active += 1;
+				maximumActive = Math.max(maximumActive, active);
+				try {
+					await controls.get(item.projectId)!.promise;
+				} finally {
+					active -= 1;
+				}
+				return {
+					segmentsApplied: 1,
+					review: {
+						total: 0,
+						pending: 0,
+						lowConfidence: 0,
+						coverage: 0,
+						long: 0,
+						wbwTimestamps: 0
+					}
+				};
+			}
+		});
+		const batch = new Batch('Batch', items);
+		const run = service.run(batch, items, localConfiguration, false);
+
+		await vi.waitFor(() => expect(started).toEqual([1]));
+		service.handleStatus({ message: 'Running', progress: 150 });
+		expect(items.find((item) => item.projectId === 1)!.segmentation.progress).toBe(90);
+		controls.get(1)!.reject(new Error('First failed'));
+		await vi.waitFor(() => expect(started).toEqual([1, 2]));
+		controls.get(2)!.resolve();
+		await vi.waitFor(() => expect(started).toEqual([1, 2, 3]));
+		controls.get(3)!.resolve();
+		await run;
+
+		expect(maximumActive).toBe(1);
+		expect(items.find((item) => item.projectId === 1)!.segmentation.status).toBe('failed');
+		expect(items.find((item) => item.projectId === 2)!.segmentation.status).toBe('auto_verified');
+		expect(items.find((item) => item.projectId === 3)!.segmentation.status).toBe('auto_verified');
+		expect(
+			items.every((item) => item.segmentation.settingsSnapshot === localConfiguration.snapshot)
+		).toBe(true);
+		expect(saves.length).toBeGreaterThan(5);
+		expect(unlisten).toHaveBeenCalledOnce();
+		expect(AutoSegmentationExecutionCoordinator.activeSource).toBeNull();
+		expect(latestProgress).toMatchObject({ progress: 100, total: 3 });
+		const finishedProgress = items[2].segmentation.progress;
+		service.handleStatus({ progress: 5 });
+		expect(items[2].segmentation.progress).toBe(finishedProgress);
+	});
+
+	it('spaces cloud requests by two minutes without waiting for the previous result', async () => {
+		vi.useFakeTimers();
+		const items = [createItem(1), createItem(2)];
+		const controls = items.map(() => deferred<void>());
+		const started: number[] = [];
+		const activities: Array<[number, string]> = [];
+		const service = new BatchSegmentationService({
+			listenStatus: async () => () => undefined,
+			saveBatch: async () => undefined,
+			onUpdate: (item, activity) => activities.push([item.projectId, activity]),
+			processItem: async (item) => {
+				started.push(item.projectId);
+				await controls[item.projectId - 1].promise;
+				return {
+					segmentsApplied: 1,
+					review: {
+						total: 0,
+						pending: 0,
+						lowConfidence: 0,
+						coverage: 0,
+						long: 0,
+						wbwTimestamps: 0
+					}
+				};
+			}
+		});
+
+		try {
+			const run = service.run(new Batch('Batch', items), items, configuration, false);
+			await vi.advanceTimersByTimeAsync(0);
+			expect(started).toEqual([1]);
+			expect(activities).toContainEqual([2, 'waiting']);
+
+			await vi.advanceTimersByTimeAsync(119_999);
+			expect(started).toEqual([1]);
+			await vi.advanceTimersByTimeAsync(1);
+			expect(started).toEqual([1, 2]);
+
+			controls.forEach((control) => control.resolve());
+			await run;
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('recovers a completed segmentation from existing subtitles', async () => {
+		const item = createItem(1);
+		const updatedAt = new Date('2026-07-18T20:00:00.000Z');
+		const subtitleTrack = {
+			clips: [
+				{ type: 'Subtitle', needsReview: false },
+				{ type: 'Pre-defined Subtitle', needsReview: false }
+			]
+		};
+		const project = {
+			detail: {
+				updatedAt,
+				percentageCaptioned: 100
+			},
+			content: {
+				timeline: {
+					getFirstTrack: (type: TrackType) =>
+						type === TrackType.Subtitle ? subtitleTrack : { clips: [] }
+				}
+			}
+		} as unknown as Project;
+		const loadProject = vi.spyOn(ProjectService, 'load').mockResolvedValue(project);
+		const saveBatch = vi.spyOn(BatchService, 'save').mockResolvedValue();
+		const batch = new Batch('Batch', [item]);
+
+		try {
+			expect(await reconcileBatchSegmentations(batch)).toBe(true);
+			expect(item.segmentation.status).toBe('auto_verified');
+			expect(item.segmentation.progress).toBe(100);
+			expect(item.segmentation.segmentsApplied).toBe(2);
+			expect(item.segmentation.completedAt).toEqual(updatedAt);
+			expect(saveBatch).toHaveBeenCalledWith(batch);
+		} finally {
+			loadProject.mockRestore();
+			saveBatch.mockRestore();
+		}
+	});
+
+	it('keeps a project not started when it has no subtitle', async () => {
+		const item = createItem(1);
+		const project = {
+			content: {
+				timeline: {
+					getFirstTrack: () => ({ clips: [] })
+				}
+			}
+		} as unknown as Project;
+		const loadProject = vi.spyOn(ProjectService, 'load').mockResolvedValue(project);
+		const saveBatch = vi.spyOn(BatchService, 'save').mockResolvedValue();
+
+		try {
+			expect(await reconcileBatchSegmentations(new Batch('Batch', [item]))).toBe(false);
+			expect(item.segmentation.status).toBe('not_started');
+			expect(saveBatch).not.toHaveBeenCalled();
+		} finally {
+			loadProject.mockRestore();
+			saveBatch.mockRestore();
+		}
+	});
+
+	it('clears a recovered coverage review when no subtitle has a real flag', async () => {
+		const item = createItem(1);
+		item.segmentation.status = 'needs_review';
+		item.segmentation.review = {
+			total: 1,
+			pending: 1,
+			lowConfidence: 0,
+			coverage: 1,
+			long: 0,
+			wbwTimestamps: 0
+		};
+		const project = {
+			content: {
+				timeline: {
+					getFirstTrack: () => ({ clips: [{ type: 'Subtitle' }] })
+				}
+			}
+		} as unknown as Project;
+		const loadProject = vi.spyOn(ProjectService, 'load').mockResolvedValue(project);
+		const saveBatch = vi.spyOn(BatchService, 'save').mockResolvedValue();
+
+		try {
+			expect(await reconcileBatchSegmentations(new Batch('Batch', [item]))).toBe(true);
+			expect(item.segmentation.status).toBe('auto_verified');
+			expect(item.segmentation.review).toEqual({
+				total: 0,
+				pending: 0,
+				lowConfidence: 0,
+				coverage: 0,
+				long: 0,
+				wbwTimestamps: 0
+			});
+		} finally {
+			loadProject.mockRestore();
+			saveBatch.mockRestore();
+		}
+	});
+
+	it('loads and saves the explicit project without replacing the global project', async () => {
+		const item = createItem(1);
+		const visibleProject = { detail: { id: 999 } } as Project;
+		const childProject = {
+			detail: { updateTimestamp: vi.fn() },
+			projectEditorState: { subtitlesEditor: { segmentationContext: null } }
+		} as unknown as Project;
+		const savedProjects: Project[] = [];
+		globalState.currentProject = visibleProject;
+		const service = new BatchSegmentationService({
+			listenStatus: async () => () => undefined,
+			saveBatch: async () => undefined,
+			loadProject: async (projectId) => {
+				expect(projectId).toBe(item.projectId);
+				return childProject;
+			},
+			runForProject: async (project, receivedConfiguration, overwrite, onApplying) => {
+				expect(project).toBe(childProject);
+				expect(receivedConfiguration).toBe(configuration);
+				expect(overwrite).toBe(false);
+				onApplying();
+				project.projectEditorState.subtitlesEditor.segmentationContext = {
+					audioId: 'child',
+					source: 'api',
+					effectiveMode: 'api',
+					modelName: 'Base',
+					device: null,
+					includeWbwTimestamps: false,
+					alignedSegments: []
+				};
+				return {
+					status: 'completed',
+					segmentsApplied: 2,
+					lowConfidenceSegments: 0,
+					coverageGapSegments: 0,
+					verseRange: new VerseRange()
+				};
+			},
+			getReview: () => ({
+				total: 0,
+				pending: 0,
+				lowConfidence: 0,
+				coverage: 0,
+				long: 0,
+				wbwTimestamps: 0
+			}),
+			saveProject: async (project) => {
+				savedProjects.push(project);
+			}
+		});
+
+		try {
+			await service.run(new Batch('Batch', [item]), [item], configuration, false);
+			expect(globalState.currentProject).toBe(visibleProject);
+			expect(savedProjects).toEqual([childProject]);
+			expect(childProject.projectEditorState.subtitlesEditor.segmentationContext?.audioId).toBe(
+				'child'
+			);
+		} finally {
+			globalState.currentProject = null;
+		}
+	});
+});
