@@ -13,7 +13,6 @@ import { exists, remove } from '@tauri-apps/plugin-fs';
 import { AnalyticsService } from '$lib/services/AnalyticsService';
 import ExportFileService from '$lib/services/ExportFileService';
 import SoosiProvider from '$lib/services/SoosiProvider';
-import WarshProvider from '$lib/services/WarshProvider';
 import MinimalQuranProvider from '$lib/services/MinimalQuranProvider';
 import type { BackgroundThrottlingPolicy } from '@tauri-apps/api/window';
 import Exportation, { ExportKind, ExportState } from './Exportation.svelte';
